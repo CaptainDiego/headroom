@@ -69,8 +69,15 @@ func readCredentials() -> Credentials? {
     return Credentials(token: token, plan: oauth["subscriptionType"] as? String)
 }
 
+/// Refuses redirects so the bearer token can never be forwarded to another host.
+final class NoRedirect: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest) async -> URLRequest? { nil }
+}
+
 // Ephemeral: no disk cache, cookies or credential storage.
-private let session = URLSession(configuration: .ephemeral)
+private let session = URLSession(configuration: .ephemeral, delegate: NoRedirect(), delegateQueue: nil)
 
 // MARK: - Store
 

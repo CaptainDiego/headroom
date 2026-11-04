@@ -16,7 +16,7 @@ CREDS=$(/usr/bin/security find-generic-password -s "Claude Code-credentials" -w 
 
 TOKEN=$(printf '%s' "$CREDS" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["claudeAiOauth"]["accessToken"])')
 
-RESP=$(printf 'Authorization: Bearer %s\n' "$TOKEN" | /usr/bin/curl -s -w '\n%{http_code}' --max-time 15 https://api.anthropic.com/api/oauth/usage \
+RESP=$(printf 'Authorization: Bearer %s\n' "$TOKEN" | /usr/bin/curl -s --proto '=https' -w '\n%{http_code}' --max-time 15 https://api.anthropic.com/api/oauth/usage \
   -H @- -H "anthropic-beta: oauth-2025-04-20" -H "User-Agent: headroom/1.0")
 CODE=$(printf '%s' "$RESP" | tail -n1)
 BODY=$(printf '%s' "$RESP" | sed '$d')
