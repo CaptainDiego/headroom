@@ -8,6 +8,11 @@ rm -rf $APP
 mkdir -p $APP/Contents/MacOS
 swiftc -Osize -parse-as-library -Xlinker -dead_strip main.swift -o $APP/Contents/MacOS/Headroom
 strip -rSTx $APP/Contents/MacOS/Headroom
+mkdir -p $APP/Contents/Resources
+ICONSET=$(mktemp -d)/AppIcon.iconset
+swift icon.swift $ICONSET
+iconutil -c icns $ICONSET -o $APP/Contents/Resources/AppIcon.icns
+rm -rf "$(dirname $ICONSET)"
 cat > $APP/Contents/Info.plist <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -15,6 +20,7 @@ cat > $APP/Contents/Info.plist <<PLIST
   <key>CFBundleIdentifier</key><string>io.github.captaindiego.headroom</string>
   <key>CFBundleName</key><string>Headroom</string>
   <key>CFBundleExecutable</key><string>Headroom</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>

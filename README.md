@@ -1,6 +1,6 @@
 # Headroom
 
-A tiny macOS menu bar app (~140 KB) that shows how much of your Claude plan you've used: your 5-hour session and weekly limits, with reset times.
+A tiny macOS menu bar app (~250 KB) that shows how much of your Claude plan you've used: your 5-hour session and weekly limits, with reset times.
 
 ```
 ✳︎ 54% · 8%
