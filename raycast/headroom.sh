@@ -25,18 +25,24 @@ BODY=$(printf '%s' "$RESP" | sed '$d')
 [ "$CODE" != "200" ] && { echo "Error: HTTP $CODE"; exit 1; }
 
 printf '%s' "$BODY" | /usr/bin/python3 -c '
-import json, sys
+import json, re, sys
 from datetime import datetime, timezone
 d = json.load(sys.stdin)
 lim = {l["kind"]: l for l in d.get("limits") or []}
+def parse(iso):
+    # macOS ships Python 3.9, whose fromisoformat rejects a "Z" suffix and
+    # fractional seconds that are not exactly 3 or 6 digits.
+    t = datetime.fromisoformat(re.sub(r"\.\d+", "", iso.replace("Z", "+00:00")))
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
 def until(iso):
     if not iso: return ""
-    secs = (datetime.fromisoformat(iso) - datetime.now(timezone.utc)).total_seconds()
+    t = parse(iso)
+    secs = (t - datetime.now(timezone.utc)).total_seconds()
     if secs <= 0: return "resetting"
     if secs < 86400:
         h, m = int(secs // 3600), int(secs % 3600 // 60)
         return f"resets {h}h {m}m" if h else f"resets {m}m"
-    return "resets " + datetime.fromisoformat(iso).astimezone().strftime("%a %-I:%M %p")
+    return "resets " + t.astimezone().strftime("%a %-I:%M %p")
 def dot(p): return "🔴" if p >= 90 else "🟠" if p >= 70 else "🟢"
 parts = []
 for kind, label in (("session", "Session"), ("weekly_all", "Week")):
@@ -44,6 +50,6 @@ for kind, label in (("session", "Session"), ("weekly_all", "Week")):
     if l:
         p = l["percent"]
         r = until(l.get("resets_at"))
-        parts.append(f"{dot(p)} {label} {int(p)}% ({r})")
+        parts.append(f"{dot(p)} {label} {int(p)}%" + (f" ({r})" if r else ""))
 print("   ".join(parts) or "No limit data")
 '

@@ -97,11 +97,7 @@ final class UsageStore: ObservableObject {
     private var timer: Timer?
 
     init() {
-        // Enable launch-at-login once on first run; afterwards respect the user's choice.
-        if !UserDefaults.standard.bool(forKey: "didSetupLogin") {
-            UserDefaults.standard.set(true, forKey: "didSetupLogin")
-            setLaunchAtLogin(true)
-        }
+        // Launch at login is opt-in: it stays off until the user enables the toggle.
         Task { await refresh() }
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             Task { await self?.refresh() }

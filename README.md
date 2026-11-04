@@ -21,7 +21,7 @@ git clone https://github.com/CaptainDiego/headroom && cd headroom
 
 - Reads the OAuth token Claude Code already stores in your Keychain (via `/usr/bin/security`, read-only).
 - Sends it only to `api.anthropic.com` over HTTPS. No other network calls, no analytics, no disk cache.
-- Stores only two local preferences (menu bar icon on/off, first-run login setup).
+- Stores only one local preference (menu bar icon on/off). Launch at login is off until you turn it on.
 
 ## Notes
 
