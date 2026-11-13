@@ -34,6 +34,8 @@ cat > $APP/Contents/Info.plist <<PLIST
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
+  <!-- Trades a little malloc speed for ~1.5-2 MB less memory; irrelevant for an idle menu bar app. -->
+  <key>LSEnvironment</key><dict><key>MallocSpaceEfficient</key><string>1</string></dict>
 </dict></plist>
 PLIST
 codesign --force --sign - $APP
