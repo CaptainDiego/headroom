@@ -1,13 +1,12 @@
-import SwiftUI
+import AppKit
 import ServiceManagement
 
 // MARK: - Models
 
-struct UsageLimit: Decodable, Identifiable {
+struct UsageLimit: Decodable {
     let kind: String
     let percent: Double
     let resets_at: String?
-    var id: String { kind }
 
     var title: String {
         switch kind {
@@ -21,11 +20,10 @@ struct UsageLimit: Decodable, Identifiable {
     var resetDate: Date? { resets_at.flatMap(parseISO) }
 }
 
-struct BreakdownRow: Decodable, Identifiable {
+struct BreakdownRow: Decodable {
     let key: String
     let display_name: String
     let percent: Double
-    var id: String { key }
 }
 
 struct UsageResponse: Decodable {
@@ -48,7 +46,7 @@ func parseISO(_ s: String) -> Date? { isoFrac.date(from: s) ?? isoPlain.date(fro
 
 // MARK: - Credentials (read from Claude Code's keychain entry)
 
-struct Credentials: Sendable { let token: String; let plan: String? }
+struct Credentials { let token: String; let plan: String? }
 
 /// Blocking: spawns /usr/bin/security. Call off the main thread.
 /// Using the `security` binary inherits the item's existing ACL, so there's no keychain prompt.
@@ -73,95 +71,46 @@ func readCredentials() -> Credentials? {
 final class NoRedirect: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask,
                     willPerformHTTPRedirection response: HTTPURLResponse,
-                    newRequest request: URLRequest) async -> URLRequest? { nil }
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
 }
 
 // Ephemeral: no disk cache, cookies or credential storage.
 private let session = URLSession(configuration: .ephemeral, delegate: NoRedirect(), delegateQueue: nil)
 
-// MARK: - Store
+enum FetchResult {
+    case noLogin
+    case failed(plan: String?, message: String)
+    case ok(plan: String?, UsageResponse)
+}
 
-@MainActor
-final class UsageStore: ObservableObject {
-    @Published var limits: [UsageLimit] = []
-    @Published var breakdown: [BreakdownRow] = []
-    @Published var plan: String?
-    @Published var error: String?
-    @Published var lastUpdated: Date?
-    @Published var loading = false
-    @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
-    @Published var loginError: String?
-    @Published var showIcon = UserDefaults.standard.object(forKey: "showIcon") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(showIcon, forKey: "showIcon") }
-    }
-    private var timer: Timer?
-
-    init() {
-        // Enable launch-at-login once on first run; afterwards respect the user's choice.
-        if !UserDefaults.standard.bool(forKey: "didSetupLogin") {
-            UserDefaults.standard.set(true, forKey: "didSetupLogin")
-            setLaunchAtLogin(true)
-        }
-        Task { await refresh() }
-        timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
-            Task { await self?.refresh() }
-        }
-    }
-
-    func setLaunchAtLogin(_ on: Bool) {
-        do {
-            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
-            loginError = nil
-        } catch { loginError = error.localizedDescription }
-        syncLoginStatus()
-    }
-
-    /// The user can also change this in System Settings, so re-read it when the panel opens.
-    func syncLoginStatus() { launchAtLogin = SMAppService.mainApp.status == .enabled }
-
-    var menuTitle: String {
-        var t = showIcon ? "✳︎ " : ""
-        if limits.isEmpty { return t + "—" }
-        let pct = { (k: String) in self.limits.first { $0.kind == k }.map { "\(Int($0.percent))%" } ?? "–" }
-        t += "\(pct("session")) · \(pct("weekly_all"))"
-        return error == nil ? t : t + " ⚠︎"   // flag stale numbers
-    }
-
-    func refresh() async {
-        guard !loading else { return }   // timer + button can overlap
-        loading = true; defer { loading = false }
-
-        guard let creds = await Task.detached(operation: readCredentials).value else {
-            error = "No Claude Code login found. Run `claude` and log in."
-            return
-        }
-        plan = creds.plan
-
+/// Reads the token and fetches usage off the main thread; `done` runs on the main queue.
+func fetchUsage(_ done: @escaping (FetchResult) -> Void) {
+    DispatchQueue.global(qos: .utility).async {
+        let finish = { (r: FetchResult) in DispatchQueue.main.async { done(r) } }
+        guard let creds = readCredentials() else { return finish(.noLogin) }
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!, timeoutInterval: 20)
         req.setValue("Bearer \(creds.token)", forHTTPHeaderField: "Authorization")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.setValue("headroom/1.0", forHTTPHeaderField: "User-Agent")
-        do {
-            let (data, resp) = try await session.data(for: req)
+        session.dataTask(with: req) { data, resp, err in
+            let fail = { (m: String) in finish(.failed(plan: creds.plan, message: m)) }
+            if let err { return fail(err.localizedDescription) }
             switch (resp as? HTTPURLResponse)?.statusCode ?? 0 {
             case 200: break
-            case 401: error = "Token expired. Open Claude Code once to refresh it."; return
-            case let code: error = "HTTP \(code)"; return
+            case 401: return fail("Token expired. Open Claude Code once to refresh it.")
+            case let code: return fail("HTTP \(code)")
             }
-            let r = try JSONDecoder().decode(UsageResponse.self, from: data)
-            limits = r.limits ?? []
-            breakdown = (r.seven_day_breakdown?.rows ?? []).filter { $0.percent > 0 }
-            lastUpdated = Date()
-            error = nil
-        } catch {
-            self.error = error.localizedDescription
-        }
+            do { finish(.ok(plan: creds.plan, try JSONDecoder().decode(UsageResponse.self, from: data ?? Data()))) }
+            catch { fail(error.localizedDescription) }
+        }.resume()
     }
 }
 
 // MARK: - Views
-
-func barColor(_ pct: Double) -> Color { pct >= 90 ? .red : pct >= 70 ? .orange : .accentColor }
+// Plain AppKit on purpose: SwiftUI's MenuBarExtra cost ~9 MB the first time the panel
+// opened and never gave it back. The panel here is built on open and dropped on close.
 
 func resetText(_ d: Date?, now: Date) -> String {
     guard let d else { return "" }
@@ -174,95 +123,273 @@ func resetText(_ d: Date?, now: Date) -> String {
     return "Resets \(dayFormatter.string(from: d))"
 }
 
-struct LimitRow: View {
-    let limit: UsageLimit
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(limit.title).font(.system(size: 12, weight: .medium))
-                Spacer()
-                Text("\(Int(limit.percent))%").font(.system(size: 12, weight: .semibold)).monospacedDigit()
-            }
-            ProgressView(value: min(limit.percent, 100), total: 100).tint(barColor(limit.percent))
-            // Keep the countdown live between 5-minute fetches.
-            TimelineView(.periodic(from: .now, by: 30)) { ctx in
-                Text(resetText(limit.resetDate, now: ctx.date)).font(.system(size: 10)).foregroundStyle(.secondary)
-            }
-        }
+func label(_ s: String, size: CGFloat, weight: NSFont.Weight = .regular, color: NSColor = .labelColor,
+           digits: Bool = false) -> NSTextField {
+    let l = NSTextField(labelWithString: s)
+    l.font = digits ? .monospacedDigitSystemFont(ofSize: size, weight: weight) : .systemFont(ofSize: size, weight: weight)
+    l.textColor = color
+    return l
+}
+
+func row(_ views: [NSView], spacing: CGFloat = 8) -> NSStackView {
+    let s = NSStackView(views: views)
+    s.spacing = spacing
+    return s
+}
+
+func spacer() -> NSView {
+    let v = NSView()
+    v.setContentHuggingPriority(.init(1), for: .horizontal)
+    return v
+}
+
+final class BarView: NSView {
+    let fraction: CGFloat, color: NSColor, thickness: CGFloat
+    init(percent: Double, color: NSColor, thickness: CGFloat) {
+        fraction = CGFloat(min(max(percent, 0), 100) / 100); self.color = color; self.thickness = thickness
+        super.init(frame: .zero)
+        setContentHuggingPriority(.init(1), for: .horizontal)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: thickness) }
+    override func draw(_ dirtyRect: NSRect) {
+        let r = thickness / 2
+        NSColor.labelColor.withAlphaComponent(0.1).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: r, yRadius: r).fill()
+        guard fraction > 0 else { return }
+        var fill = bounds; fill.size.width = max(bounds.width * fraction, thickness)
+        color.setFill()
+        NSBezierPath(roundedRect: fill, xRadius: r, yRadius: r).fill()
     }
 }
 
-struct ContentView: View {
-    @ObservedObject var store: UsageStore
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Claude Usage").font(.headline)
-                Spacer()
-                if let plan = store.plan {
-                    Text(plan.capitalized)
-                        .font(.system(size: 10, weight: .semibold))
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(Capsule().fill(Color.accentColor.opacity(0.15)))
-                }
-            }
-            if let err = store.error {
-                Text(err).font(.system(size: 11)).foregroundStyle(.red)
-            }
-            ForEach(store.limits) { LimitRow(limit: $0) }
-
-            if !store.breakdown.isEmpty {
-                Divider()
-                Text("This week by surface").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-                ForEach(store.breakdown) { row in
-                    HStack {
-                        Text(row.display_name)
-                        Spacer()
-                        Text("\(Int(row.percent))%").monospacedDigit().foregroundStyle(.secondary)
-                    }
-                    .font(.system(size: 11))
-                }
-            }
-            Divider()
-            Group {
-                Toggle("Launch at login", isOn: Binding(get: { store.launchAtLogin }, set: store.setLaunchAtLogin))
-                Toggle("Show ✳︎ in menu bar", isOn: $store.showIcon)
-            }
-            .font(.system(size: 11))
-            if let e = store.loginError {
-                Text(e).font(.system(size: 10)).foregroundStyle(.red)
-            }
-            Divider()
-            HStack {
-                if let t = store.lastUpdated {
-                    Text("Updated \(t.formatted(date: .omitted, time: .shortened))")
-                        .font(.system(size: 10)).foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button { Task { await store.refresh() } } label: { Image(systemName: "arrow.clockwise") }
-                    .disabled(store.loading).help("Refresh")
-                Button { NSWorkspace.shared.open(URL(string: "https://claude.ai/settings/usage")!) } label: {
-                    Image(systemName: "safari")
-                }.help("Open usage page")
-                Button { NSApp.terminate(nil) } label: { Image(systemName: "power") }.help("Quit")
-            }
-            .buttonStyle(.borderless)
-        }
-        .padding(14)
-        .frame(width: 280)
-        .onAppear(perform: store.syncLoginStatus)
+final class PillView: NSView {
+    init(_ text: String) {
+        super.init(frame: .zero)
+        let l = label(text, size: 10, weight: .semibold)
+        l.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(l)
+        NSLayoutConstraint.activate([
+            l.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6), l.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            l.topAnchor.constraint(equalTo: topAnchor, constant: 2), l.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.controlAccentColor.withAlphaComponent(0.15).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2).fill()
     }
 }
+
+// MARK: - App
 
 @main
-struct HeadroomApp: App {
-    @StateObject private var store = UsageStore()
-    var body: some Scene {
-        MenuBarExtra {
-            ContentView(store: store)
-        } label: {
-            Text(store.menuTitle).monospacedDigit()
-        }
-        .menuBarExtraStyle(.window)
+@MainActor
+final class Headroom: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = Headroom()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        withExtendedLifetime(delegate) { app.run() }
     }
+
+    var limits: [UsageLimit] = []
+    var breakdown: [BreakdownRow] = []
+    var plan: String?
+    var error: String?
+    var lastUpdated: Date?
+    var loading = false
+    var loginError: String?
+    var showIcon = UserDefaults.standard.object(forKey: "showIcon") as? Bool ?? true
+
+    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let menu = NSMenu()
+    let panelItem = NSMenuItem()
+    var countdowns: [(NSTextField, Date?)] = []   // only while the panel is open
+    var countdownTimer: Timer?
+
+    func applicationDidFinishLaunching(_ note: Notification) {
+        statusItem.button?.font = .monospacedDigitSystemFont(ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)
+        menu.delegate = self
+        menu.addItem(panelItem)
+        statusItem.menu = menu
+        updateTitle()
+        // Enable launch-at-login once on first run; afterwards respect the user's choice.
+        if !UserDefaults.standard.bool(forKey: "didSetupLogin") {
+            UserDefaults.standard.set(true, forKey: "didSetupLogin")
+            try? SMAppService.mainApp.register()
+        }
+        refresh()
+        Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refresh() }
+        }
+    }
+
+    func updateTitle() {
+        var t = showIcon ? "✳︎ " : ""
+        if limits.isEmpty { t += "—" } else {
+            let pct = { (k: String) in self.limits.first { $0.kind == k }.map { "\(Int($0.percent))%" } ?? "–" }
+            t += "\(pct("session")) · \(pct("weekly_all"))"
+            if error != nil { t += " ⚠︎" }   // flag stale numbers
+        }
+        statusItem.button?.title = t
+    }
+
+    @objc func refresh() {
+        guard !loading else { return }   // timer + button can overlap
+        loading = true
+        stateChanged()
+        fetchUsage { [self] result in
+            switch result {
+            case .noLogin:
+                error = "No Claude Code login found. Run `claude` and log in."
+            case .failed(let p, let message):
+                plan = p; error = message
+            case .ok(let p, let r):
+                plan = p
+                limits = r.limits ?? []
+                breakdown = (r.seven_day_breakdown?.rows ?? []).filter { $0.percent > 0 }
+                lastUpdated = Date()
+                error = nil
+            }
+            loading = false
+            stateChanged()
+        }
+    }
+
+    func stateChanged() {
+        updateTitle()
+        if panelItem.view != nil { panelItem.view = buildPanel() }   // panel is open: redraw it
+    }
+
+    // MARK: Panel (exists only while the menu is open)
+
+    func menuWillOpen(_ menu: NSMenu) {
+        panelItem.view = buildPanel()
+        // Keep the countdown live between 5-minute fetches.
+        let t = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.countdowns.forEach { $0.0.stringValue = resetText($0.1, now: Date()) } }
+        }
+        RunLoop.main.add(t, forMode: .common)   // .common: the menu runs the loop in event-tracking mode
+        countdownTimer = t
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        countdownTimer?.invalidate(); countdownTimer = nil
+        countdowns = []
+        panelItem.view = nil
+    }
+
+    func buildPanel() -> NSView {
+        countdowns = []
+        var rows: [NSView] = []
+
+        var header: [NSView] = [label("Claude Usage", size: NSFont.systemFontSize, weight: .semibold), spacer()]
+        if let plan { header.append(PillView(plan.capitalized)) }
+        rows.append(row(header))
+
+        if let error {
+            rows.append(errorLabel(error, size: 11))
+        }
+        let now = Date()
+        for limit in limits {
+            let color: NSColor = limit.percent >= 90 ? .systemRed : limit.percent >= 70 ? .systemOrange : .controlAccentColor
+            let reset = label(resetText(limit.resetDate, now: now), size: 10, color: .secondaryLabelColor)
+            countdowns.append((reset, limit.resetDate))
+            let v = NSStackView(views: [
+                row([label(limit.title, size: 12, weight: .medium), spacer(),
+                     label("\(Int(limit.percent))%", size: 12, weight: .semibold, digits: true)]),
+                BarView(percent: limit.percent, color: color, thickness: 6),
+                reset,
+            ])
+            v.orientation = .vertical; v.alignment = .leading; v.spacing = 4
+            v.arrangedSubviews.prefix(2).forEach { $0.widthAnchor.constraint(equalTo: v.widthAnchor).isActive = true }
+            rows.append(v)
+        }
+        if !breakdown.isEmpty {
+            rows.append(separator())
+            rows.append(label("This week by surface", size: 11, weight: .medium, color: .secondaryLabelColor))
+            // Share of this week's usage (rows sum to ~100%), not % of the limit.
+            for b in breakdown {
+                let name = label(b.display_name, size: 11)
+                name.lineBreakMode = .byTruncatingTail
+                name.widthAnchor.constraint(equalToConstant: 80).isActive = true
+                let pct = label("\(Int(b.percent))%", size: 11, color: .secondaryLabelColor, digits: true)
+                pct.alignment = .right
+                pct.widthAnchor.constraint(equalToConstant: 32).isActive = true
+                rows.append(row([name, BarView(percent: b.percent, color: .secondaryLabelColor, thickness: 4), pct]))
+            }
+        }
+        rows.append(separator())
+        // The user can also change this in System Settings, so it is re-read whenever the panel is built.
+        let login = NSButton(checkboxWithTitle: "Launch at login", target: self, action: #selector(toggleLogin))
+        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        let icon = NSButton(checkboxWithTitle: "Show ✳︎ in menu bar", target: self, action: #selector(toggleIcon))
+        icon.state = showIcon ? .on : .off
+        for b in [login, icon] { b.font = .systemFont(ofSize: 11); rows.append(b) }
+        if let loginError {
+            rows.append(errorLabel(loginError, size: 10))
+        }
+        rows.append(separator())
+
+        var footer: [NSView] = []
+        if let lastUpdated {
+            let f = DateFormatter(); f.timeStyle = .short
+            footer.append(label("Updated \(f.string(from: lastUpdated))", size: 10, color: .secondaryLabelColor))
+        }
+        footer.append(spacer())
+        let refreshButton = iconButton("arrow.clockwise", "Refresh", #selector(refresh))
+        refreshButton.isEnabled = !loading
+        footer += [refreshButton, iconButton("safari", "Open usage page", #selector(openUsagePage)),
+                   iconButton("power", "Quit", #selector(quit))]
+        rows.append(row(footer))
+
+        let panel = NSStackView(views: rows)
+        panel.orientation = .vertical; panel.alignment = .leading; panel.spacing = 12
+        panel.edgeInsets = NSEdgeInsets(top: 9, left: 14, bottom: 9, right: 14)   // the menu adds ~5pt above and below
+        for v in rows { v.widthAnchor.constraint(equalTo: panel.widthAnchor, constant: -28).isActive = true }
+        panel.widthAnchor.constraint(equalToConstant: 280).isActive = true
+        panel.frame.size = panel.fittingSize
+        return panel
+    }
+
+    func errorLabel(_ text: String, size: CGFloat) -> NSView {
+        let l = NSTextField(wrappingLabelWithString: text)
+        l.font = .systemFont(ofSize: size); l.textColor = .systemRed; l.isSelectable = false
+        l.preferredMaxLayoutWidth = 252   // panel width minus insets, so fittingSize accounts for wrapping
+        return l
+    }
+
+    func separator() -> NSView {
+        let b = NSBox(); b.boxType = .separator; return b
+    }
+
+    func iconButton(_ symbol: String, _ help: String, _ action: Selector) -> NSButton {
+        let b = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: help)!, target: self, action: action)
+        b.isBordered = false
+        b.toolTip = help
+        return b
+    }
+
+    @objc func toggleLogin(_ sender: NSButton) {
+        do {
+            if sender.state == .on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+            loginError = nil
+        } catch { loginError = error.localizedDescription }
+        stateChanged()
+    }
+
+    @objc func toggleIcon(_ sender: NSButton) {
+        showIcon = sender.state == .on
+        UserDefaults.standard.set(showIcon, forKey: "showIcon")
+        updateTitle()
+    }
+
+    @objc func openUsagePage() {
+        menu.cancelTracking()
+        NSWorkspace.shared.open(URL(string: "https://claude.ai/settings/usage")!)
+    }
+
+    @objc func quit() { NSApp.terminate(nil) }
 }
