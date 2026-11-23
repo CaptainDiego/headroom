@@ -82,7 +82,8 @@ private let session = URLSession(configuration: .ephemeral, delegate: NoRedirect
 enum FetchResult {
     case noLogin
     case failed(plan: String?, message: String)
-    case ok(plan: String?, UsageResponse)
+    case rateLimited(plan: String?, retryAfter: TimeInterval?)
+    case ok(plan: String?, UsageResponse, raw: Data)
 }
 
 /// Reads the token and fetches usage off the main thread; `done` runs on the main queue.
@@ -100,9 +101,13 @@ func fetchUsage(_ done: @escaping (FetchResult) -> Void) {
             switch (resp as? HTTPURLResponse)?.statusCode ?? 0 {
             case 200: break
             case 401: return fail("Token expired. Open Claude Code once to refresh it.")
+            case 429:
+                let header = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After")
+                return finish(.rateLimited(plan: creds.plan, retryAfter: header.flatMap { TimeInterval($0.trimmingCharacters(in: .whitespaces)) }))
             case let code: return fail("HTTP \(code)")
             }
-            do { finish(.ok(plan: creds.plan, try JSONDecoder().decode(UsageResponse.self, from: data ?? Data()))) }
+            let body = data ?? Data()
+            do { finish(.ok(plan: creds.plan, try JSONDecoder().decode(UsageResponse.self, from: body), raw: body)) }
             catch { fail(error.localizedDescription) }
         }.resume()
     }
@@ -208,6 +213,11 @@ final class Headroom: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let panelItem = NSMenuItem()
     var countdowns: [(NSTextField, Date?)] = []   // only while the panel is open
     var countdownTimer: Timer?
+    var pollTimer: Timer?
+    var backoff: TimeInterval = 0   // grows while the API keeps answering 429
+
+    static let pollInterval: TimeInterval = 300
+    static let cacheKey = "lastUsageResponse", cacheDateKey = "lastUsageDate"
 
     func applicationDidFinishLaunching(_ note: Notification) {
         statusItem.button?.font = .monospacedDigitSystemFont(ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)
@@ -220,10 +230,33 @@ final class Headroom: NSObject, NSApplicationDelegate, NSMenuDelegate {
             UserDefaults.standard.set(true, forKey: "didSetupLogin")
             try? SMAppService.mainApp.register()
         }
+        loadCache()
         refresh()
-        Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+    }
+
+    /// Shows the last good numbers right away, so a relaunch during a rate limit isn't blank.
+    func loadCache() {
+        let d = UserDefaults.standard
+        guard let raw = d.data(forKey: Self.cacheKey),
+              let r = try? JSONDecoder().decode(UsageResponse.self, from: raw) else { return }
+        apply(r)
+        lastUpdated = d.object(forKey: Self.cacheDateKey) as? Date
+        updateTitle()
+    }
+
+    func apply(_ r: UsageResponse) {
+        limits = r.limits ?? []
+        breakdown = (r.seven_day_breakdown?.rows ?? []).filter { $0.percent > 0 }
+    }
+
+    /// One-shot timer, so a 429 can push the next fetch further out instead of retrying every 5 min.
+    func scheduleNext(after secs: TimeInterval) {
+        pollTimer?.invalidate()
+        let t = Timer(timeInterval: secs, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { self?.refresh() }
         }
+        RunLoop.main.add(t, forMode: .common)
+        pollTimer = t
     }
 
     func updateTitle() {
@@ -246,13 +279,25 @@ final class Headroom: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 error = "No Claude Code login found. Run `claude` and log in."
             case .failed(let p, let message):
                 plan = p; error = message
-            case .ok(let p, let r):
+            case .rateLimited(let p, let retryAfter):
                 plan = p
-                limits = r.limits ?? []
-                breakdown = (r.seven_day_breakdown?.rows ?? []).filter { $0.percent > 0 }
+                // Honor Retry-After when given; otherwise back off 5 → 10 → 20 → 30 min.
+                backoff = min(max(backoff * 2, Self.pollInterval), 1800)
+                let wait = max(retryAfter ?? backoff, 60)
+                error = "Rate limited by Anthropic. Retrying in \(Int((wait / 60).rounded(.up))) min."
+                loading = false
+                stateChanged()
+                return scheduleNext(after: wait)
+            case .ok(let p, let r, let raw):
+                plan = p
+                apply(r)
                 lastUpdated = Date()
                 error = nil
+                backoff = 0
+                UserDefaults.standard.set(raw, forKey: Self.cacheKey)
+                UserDefaults.standard.set(lastUpdated, forKey: Self.cacheDateKey)
             }
+            scheduleNext(after: Self.pollInterval)
             loading = false
             stateChanged()
         }
